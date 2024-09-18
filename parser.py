@@ -1,50 +1,12 @@
 import re
 from dataclasses import dataclass
 from typing import List, Optional, Union
-import numpy as np
+import numpy
+import math
 
-import numpy as np
-
-def print_matrix_vector(M, V):
-    """
-    Print a matrix M and a vector V side by side.
-
-    :param M: NxN NumPy array (square matrix)
-    :param V: Nx1 NumPy array (column vector)
-    """
-    # Ensure M is square and V has the same number of rows as M
-    assert M.shape[0] == M.shape[1], "M must be a square matrix"
-    assert M.shape[0] == V.shape[0], "V must have the same number of rows as M"
-    assert V.shape[1] == 1, "V must be a column vector"
-
-    # Convert V to a 2D array for consistent formatting
-    V_2D = V.reshape(-1, 1)
-
-    # Combine M and V horizontally
-    combined = np.hstack((M, V_2D))
-
-    # Determine the width for formatting based on the largest absolute value
-    max_val = max(np.abs(combined).max(), 1)
-    width = max(8, int(np.log10(max_val)) + 6)
-
-    # Print the header
-    print(f"{'M'.ljust(width * M.shape[1])}V")
-    print("-" * (width * (M.shape[1] + 1)))
-
-    # Custom format function
-    def format_number(x):
-        if abs(x) < 1e-10:  # Consider values very close to 0 as 0
-            return f"{'0':>{width}}"
-        else:
-            return f"{x:{width}.4f}"
-
-    for row in combined:
-        # Format each number in the row
-        formatted_row = [format_number(x) for x in row]
-
-        # Join the M part and the V part
-        print("".join(formatted_row[:-1]) + " | " + formatted_row[-1])
-
+exp = math.exp
+vt = 26e-3
+isat = 1e-3
 
 def get_all_nodes(elements):
     nodes = set()
@@ -74,73 +36,128 @@ def get_group2_indices(elements, num_nodes):
     return group2_indices
 
 
-def v_stamp(matrix, rhs, element):
+def get_nonlinear_indices(elements):
+    nonlinear_indices = []
+    for index, element in enumerate(elements):
+        if element.element_type in 'DQM':
+            nonlinear_indices.append(index)
+    return nonlinear_indices
+
+
+
+def v_stamp(matrix, rhs, element, positive=True):
     assert element.element_type == 'V'
     np = element.node_plus - 1
     nm = element.node_minus - 1
     val = element.value
     ie = element.num_nodes - 1 + element.g2_index
-    if np >= 0: matrix[np, ie] += +1
-    if nm >= 0: matrix[nm, ie] += -1
-    if np >= 0: matrix[ie, np] += +1
-    if nm >= 0: matrix[ie, nm] += -1
-    rhs[ie, 0] += +val
+    if np >= 0: matrix[np, ie] += +1 if positive else -1
+    if nm >= 0: matrix[nm, ie] += -1 if positive else +1
+    if np >= 0: matrix[ie, np] += +1 if positive else -1
+    if nm >= 0: matrix[ie, nm] += -1 if positive else +1
+    rhs[ie, 0] += +val if positive else -val
 
-def i_stamp(matrix, rhs, element):
+def i_stamp(matrix, rhs, element, positive=True):
     assert element.element_type == 'I'
     np = element.node_plus - 1
     nm = element.node_minus - 1
     val = element.value
     if element.g2_index == None:
-        if np >= 0: rhs[np, 0] += -val
-        if nm >= 0: rhs[nm, 0] += +val
+        if np >= 0: rhs[np, 0] += -val if positive else +val
+        if nm >= 0: rhs[nm, 0] += +val if positive else -val
     else:
         ie = element.num_nodes - 1 + element.g2_index
-        if np >= 0: matrix[np, ie] += +1
-        if nm >= 0: matrix[nm, ie] += -1
-        matrix[ie, ie] += -1
-        rhs[ie, 0] += +val
+        if np >= 0: matrix[np, ie] += +1 if positive else -1
+        if nm >= 0: matrix[nm, ie] += -1 if positive else +1
+        matrix[ie, ie] += -1 if positive else +1
+        rhs[ie, 0] += +val if positive else -val
 
-def r_stamp(matrix, rhs, element):
+def r_stamp(matrix, rhs, element, positive=True):
     assert element.element_type == 'R'
     np = element.node_plus - 1
     nm = element.node_minus - 1
     val = element.value
     if element.g2_index == None:
-        if np >= 0: matrix[np, np] += +1/val
-        if (np >= 0) and (nm >= 0): matrix[np, nm] += -1/val
-        if (np >= 0) and (nm >= 0): matrix[nm, np] += -1/val
-        if nm >= 0: matrix[nm, nm] += +1/val
+        if np >= 0: matrix[np, np] += +1/val if positive else -1/val
+        if (np >= 0) and (nm >= 0): matrix[np, nm] += -1/val if positive else +1/val
+        if (np >= 0) and (nm >= 0): matrix[nm, np] += -1/val if positive else +1/val
+        if nm >= 0: matrix[nm, nm] += +1/val if positive else -1/val
     else:
         ie = element.num_nodes - 1 + element.g2_index
-        if np >= 0: matrix[np, ie] += +1
-        if nm >= 0: matrix[nm, ie] += -1
-        if np >= 0: matrix[ie, np] += +1
-        if nm >= 0: matrix[ie, nm] += -1
-        matrix[ie, ie] += -val
+        if np >= 0: matrix[np, ie] += +1 if positive else -1
+        if nm >= 0: matrix[nm, ie] += -1 if positive else +1
+        if np >= 0: matrix[ie, np] += +1 if positive else -1
+        if nm >= 0: matrix[ie, nm] += -1 if positive else +1
+        matrix[ie, ie] += -val if positive else +val
 
-def stamp(matrix, rhs, element):
+
+f_op_g = lambda v: (isat/vt)*exp(v/vt)
+f_op_r = lambda v: 1/f_op_g(v)
+f_op_i = lambda v: isat*(exp(v/vt)-1)-(isat/vt)*v*exp(v/vt)
+def d_stamp(matrix, rhs, element, positive=True, sol=None):
+    assert element.element_type == 'D'
+    np = element.node_plus - 1
+    nm = element.node_minus - 1
+    if sol==None:
+        sol = [0 for _ in range(len(rhs))]
+    else:
+        assert isinstance(sol, list)
+    op_r = CircuitElement(
+        element_type='R',
+        number=0,
+        node_plus=np+1,
+        node_minus=nm+1,
+        value=f_op_r((sol[np] if np >= 0 else 0) - (sol[nm] if nm >= 0 else 0))
+    )
+    r_stamp(matrix, rhs, op_r, positive)
+    op_i = CircuitElement(
+        element_type='I',
+        number=0,
+        node_plus=np+1,
+        node_minus=nm+1,
+        value=f_op_i((sol[np] if np >= 0 else 0) - (sol[nm] if nm >= 0 else 0))
+    )
+    i_stamp(matrix, rhs, op_i, positive)
+
+
+def stamp(matrix, rhs, element, positive=True, sol=None):
     if element.element_type == 'V':
-        v_stamp(matrix, rhs, element)
+        v_stamp(matrix, rhs, element, positive)
     elif element.element_type == 'I':
-        i_stamp(matrix, rhs, element)
+        i_stamp(matrix, rhs, element, positive)
     elif element.element_type == 'R':
-        r_stamp(matrix, rhs, element)
+        r_stamp(matrix, rhs, element, positive)
+    elif element.element_type == 'D':
+        d_stamp(matrix, rhs, element, positive, sol)
     else:
         raise ValueError(f"Unknown element type for stamp: {element.element_type}")
 
 
 
-def get_matrix(elements):
-    all_nodes = get_all_nodes(elements)
-    group2_indices = get_group2_indices(elements, len(all_nodes))
-    matrix_dim = len(all_nodes)-1+len(group2_indices)
-    matrix = np.zeros((matrix_dim,matrix_dim))
-    rhs = np.zeros((matrix_dim,1))
+def init_matrix(elements, matrix, rhs):
     for element in elements:
         stamp(matrix, rhs, element)
-    print(np.linalg.solve(matrix, rhs))
 
+def dc(elements):
+    all_nodes = get_all_nodes(elements)
+    group2_indices = get_group2_indices(elements, len(all_nodes))
+    nonlinear_indices = get_nonlinear_indices(elements)
+    matrix_dim = len(all_nodes)-1+len(group2_indices)
+    matrix = numpy.zeros((matrix_dim,matrix_dim))
+    rhs = numpy.zeros((matrix_dim,1))
+    init_matrix(elements, matrix, rhs)
+    if nonlinear_indices == []:
+        print(numpy.linalg.solve(matrix, rhs))
+    else:
+        prev_sol = [0 for _ in range(matrix_dim)]
+        cur_sol = [float(item[0]) for item in numpy.linalg.solve(matrix, rhs)]
+        for i in range(10):
+            for j in nonlinear_indices:
+                stamp(matrix, rhs, elements[j], positive=False, sol=prev_sol)
+                stamp(matrix, rhs, elements[j], positive=True, sol=cur_sol)
+            prev_sol = cur_sol
+            cur_sol = [float(item[0]) for item in numpy.linalg.solve(matrix, rhs)]
+            print(prev_sol)
 @dataclass
 class CircuitElement:
     element_type: str
@@ -259,8 +276,8 @@ class CircuitParser:
 
 # Usage example
 parser = CircuitParser()
-parser.parse_file('circuit_specification.txt')
+parser.parse_file('diode.txt')
 elements = parser.get_elements()
 
 # Print parsed elements
-print(get_matrix(elements))
+dc(elements)
