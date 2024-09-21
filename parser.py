@@ -1,12 +1,60 @@
 import re
 from dataclasses import dataclass
-from typing import List, Optional, Union
+from typing import List, Optional, Union, Dict
 import numpy
 import math
 
 exp = math.exp
 vt = 26e-3
 isat = 1e-3
+
+def eng_value(value_str: str) -> float:
+    """
+    Parse a string representation of a value and return the corresponding float.
+    
+    Args:
+    value_str (str): A string representing a numeric value, potentially with suffixes like K, M, or scientific notation.
+    
+    Returns:
+    float: The parsed numeric value.
+    """
+    value_str = value_str.upper()
+    
+    # Try to directly convert to float
+    try:
+        return float(value_str)
+    except ValueError:
+        pass
+    
+    # Handle suffixes
+    suffixes = {
+        'T': 1e12,
+        'G': 1e9,
+        'MEG': 1e6,
+        'K': 1e3,
+        'M': 1e-3,
+        'U': 1e-6,
+        'N': 1e-9,
+        'P': 1e-12,
+        'F': 1e-15,
+    }
+    
+    for suffix, multiplier in suffixes.items():
+        if value_str.endswith(suffix):
+            try:
+                return float(value_str[:-1]) * multiplier
+            except ValueError:
+                pass
+    
+    # Handle scientific notation
+    try:
+        return float(value_str.replace('E', 'e'))
+    except ValueError:
+        pass
+    
+    # If all parsing attempts fail, raise an exception
+    raise ValueError(f"Unable to parse value: {value_str}")
+
 
 def get_all_nodes(elements):
     nodes = set()
@@ -158,13 +206,15 @@ def dc(elements):
             prev_sol = cur_sol
             cur_sol = [float(item[0]) for item in numpy.linalg.solve(matrix, rhs)]
             print(prev_sol)
+
+
 @dataclass
 class CircuitElement:
     element_type: str
-    number: int
+    number: str
     node_plus: int
     node_minus: int
-    value: float
+    value: Union[float, str]
     group: Optional[int] = None
     node_c: Optional[int] = None
     node_b: Optional[int] = None
@@ -175,14 +225,34 @@ class CircuitElement:
     g2_index: Optional[int] = None
     num_nodes: Optional[int] = None
 
+@dataclass
+class Model:
+    name: str
+    model_type: str
+    parameters: Dict[str, float]
+
+    def __init__(self, name: str, model_type: str, parameters: Dict[str, str]):
+        self.name = name
+        self.model_type = model_type
+        self.parameters = {key: eng_value(value) for key, value in parameters.items()}
+
+    def get_parameter(self, param_name: str, default: float = None) -> float:
+        return self.parameters.get(param_name, default)
+
+
 # V must in group 2
 class CircuitParser:
     def __init__(self):
         self.elements: List[CircuitElement] = []
+        self.models: Dict[str, Dict[str, float]] = {}
 
     def parse_file(self, filename: str) -> None:
         with open(filename, 'r') as file:
+            i = 0
             for line in file:
+                if (i == 0):
+                    i += 1
+                    continue
                 self.parse_line(line)
 
     def parse_line(self, line: str) -> None:
@@ -195,7 +265,11 @@ class CircuitParser:
         tokens = re.split(r'\s+', line)
         element_type = tokens[0][0].upper()
 
-        if element_type in 'VI':
+        if element_type in '*':
+            pass
+        elif tokens[0].upper() == '.MODEL':
+            self.parse_model(tokens)
+        elif element_type in 'VI':
             self.parse_vi(tokens)
         elif element_type == 'R':
             self.parse_r(tokens)
@@ -205,16 +279,38 @@ class CircuitParser:
             self.parse_d(tokens)
         elif element_type in 'QM':
             self.parse_qm(tokens)
+        elif element_type in '.':
+            pass
         else:
             raise ValueError(f"Unknown element type: {element_type}")
+
+    def parse_model(self, tokens: List[str]) -> None:
+        # Extract model name and type
+        model_name = tokens[1]
+        model_type = tokens[2]
+
+        # Initialize parameters dictionary
+        parameters = {}
+
+        # Parse parameters
+        for param in tokens[3:]:
+            key, value = param.split('=')
+            parameters[key.strip()] = value.strip()
+
+        # Create Model instance
+        model = Model(model_name, model_type, parameters)
+
+        # Add model to the models dictionary
+        self.models[model_name] = model
+
 
     def parse_vi(self, tokens: List[str]) -> None:
         element = CircuitElement(
             element_type=tokens[0][0],
-            number=int(tokens[0][1:]),
+            number=str(tokens[0][1:]),
             node_plus=int(tokens[1]),
             node_minus=int(tokens[2]),
-            value=float(tokens[3])
+            value=eng_value(tokens[3])
         )
         if tokens[0][0] == 'V':
             element.group = 2
@@ -223,10 +319,10 @@ class CircuitParser:
     def parse_r(self, tokens: List[str]) -> None:
         element = CircuitElement(
             element_type='R',
-            number=int(tokens[0][1:]),
+            number=str(tokens[0][1:]),
             node_plus=int(tokens[1]),
             node_minus=int(tokens[2]),
-            value=float(tokens[3])
+            value=eng_value(tokens[3])
         )
         if len(tokens) > 4 and tokens[4].upper() == 'G2':
             element.group = 2
@@ -235,10 +331,10 @@ class CircuitParser:
     def parse_cl(self, tokens: List[str]) -> None:
         element = CircuitElement(
             element_type=tokens[0][0],
-            number=int(tokens[0][1:]),
+            number=str(tokens[0][1:]),
             node_plus=int(tokens[1]),
             node_minus=int(tokens[2]),
-            value=float(tokens[3])
+            value=eng_value(tokens[3])
         )
         if len(tokens) > 4:
             element.group = 2
@@ -247,7 +343,7 @@ class CircuitParser:
     def parse_d(self, tokens: List[str]) -> None:
         element = CircuitElement(
             element_type='D',
-            number=int(tokens[0][1:]),
+            number=str(tokens[0][1:]),
             node_plus=int(tokens[1]),
             node_minus=int(tokens[2]),
             value=1.0  # Default value
@@ -258,26 +354,21 @@ class CircuitParser:
 
     def parse_qm(self, tokens: List[str]) -> None:
         element = CircuitElement(
-            element_type=tokens[0][:2],
-            number=int(tokens[0][2:]),
+            element_type=tokens[0][:1],
+            number=str(tokens[0][1:]),
             node_c=int(tokens[1]),
             node_b=int(tokens[2]),
             node_e=int(tokens[3]),
-            value=1.0,  # Default value
+            value=str(tokens[4]),
             node_plus=int(tokens[1]),  # Set node_plus to collector
             node_minus=int(tokens[3])  # Set node_minus to emitter
         )
-        if len(tokens) > 4:
-            element.value = float(tokens[4])
         self.elements.append(element)
 
     def get_elements(self) -> List[CircuitElement]:
         return self.elements
 
-# Usage example
-parser = CircuitParser()
-parser.parse_file('diode.txt')
-elements = parser.get_elements()
 
-# Print parsed elements
-dc(elements)
+    def get_models(self) -> Dict[str, str]:
+        return self.models
+
